@@ -1,0 +1,13 @@
+apiVersion: v2
+name: airgap-postgres
+description: A Helm chart for PostgreSQL 18 HA deployment in air-gapped environments
+type: application
+version: 0.1.0
+appVersion: "18"
+keywords:
+  - postgresql
+  - database
+  - ha
+  - airgap
+maintainers:
+  - name: Platform Team

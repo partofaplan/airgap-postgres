@@ -1,0 +1,137 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "airgap-postgres.fullname" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "airgap-postgres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        metadata:
+          labels:
+            {{- include "airgap-postgres.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          {{- with .Values.global.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          serviceAccountName: {{ include "airgap-postgres.serviceAccountName" . }}
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            fsGroup: 999
+          containers:
+            - name: backup
+              image: {{ include "airgap-postgres.backup.image" . }}
+              imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false
+                capabilities:
+                  drop:
+                    - ALL
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -e
+
+                  echo "Starting PostgreSQL backup at $(date)"
+
+                  # Configuration
+                  BACKUP_DIR="/backups"
+                  TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                  BACKUP_FILE="${BACKUP_DIR}/backup_${TIMESTAMP}.sql.gz"
+                  RETENTION_DAYS={{ .Values.backup.retentionDays }}
+
+                  # Database connection
+                  DB_HOST="{{ include "airgap-postgres.primary.serviceName" . }}"
+                  DB_PORT="5432"
+                  DB_NAME="{{ .Values.postgresql.database }}"
+                  DB_USER="postgres"
+
+                  echo "Connecting to ${DB_HOST}:${DB_PORT}/${DB_NAME}"
+
+                  # Wait for database to be ready
+                  until pg_isready -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER}; do
+                    echo "Waiting for database to be ready..."
+                    sleep 5
+                  done
+
+                  echo "Database is ready, starting backup..."
+
+                  # Create backup directory if it doesn't exist
+                  mkdir -p ${BACKUP_DIR}
+
+                  # Perform the backup using pg_dumpall for complete backup
+                  pg_dumpall -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} | gzip > ${BACKUP_FILE}
+
+                  # Check if backup was successful
+                  if [ $? -eq 0 ] && [ -s ${BACKUP_FILE} ]; then
+                    BACKUP_SIZE=$(du -h ${BACKUP_FILE} | cut -f1)
+                    echo "Backup completed successfully: ${BACKUP_FILE} (${BACKUP_SIZE})"
+
+                    # Create a symlink to the latest backup
+                    ln -sf ${BACKUP_FILE} ${BACKUP_DIR}/latest.sql.gz
+                    echo "Updated latest backup symlink"
+
+                    # Cleanup old backups
+                    echo "Cleaning up backups older than ${RETENTION_DAYS} days..."
+                    find ${BACKUP_DIR} -name "backup_*.sql.gz" -mtime +${RETENTION_DAYS} -delete
+                    echo "Cleanup completed"
+
+                    # List current backups
+                    echo "Current backups:"
+                    ls -la ${BACKUP_DIR}/*.sql.gz 2>/dev/null || echo "No backups found"
+
+                  else
+                    echo "ERROR: Backup failed!"
+                    rm -f ${BACKUP_FILE}
+                    exit 1
+                  fi
+
+                  echo "Backup job completed at $(date)"
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "airgap-postgres.secretName" . }}
+                      key: postgresql-postgres-password
+              volumeMounts:
+                - name: backup-storage
+                  mountPath: /backups
+              resources:
+                requests:
+                  memory: "128Mi"
+                  cpu: "100m"
+                limits:
+                  memory: "512Mi"
+                  cpu: "500m"
+          volumes:
+            - name: backup-storage
+              {{- if .Values.backup.persistence.enabled }}
+              persistentVolumeClaim:
+                claimName: {{ include "airgap-postgres.fullname" . }}-backup
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

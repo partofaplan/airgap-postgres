@@ -1,0 +1,174 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "airgap-postgres.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "airgap-postgres.labels" . | nindent 4 }}
+data:
+  # Primary server configuration
+  primary-postgresql.conf: |
+    # Connection settings
+    listen_addresses = '*'
+    port = 5432
+    max_connections = 200
+
+    # Memory settings
+    shared_buffers = 256MB
+    effective_cache_size = 768MB
+    work_mem = 4MB
+    maintenance_work_mem = 64MB
+
+    # WAL settings for replication
+    wal_level = replica
+    max_wal_senders = 10
+    wal_keep_size = 1GB
+    max_replication_slots = 10
+    hot_standby = on
+    hot_standby_feedback = on
+
+    # Synchronous replication
+    synchronous_commit = {{ .Values.postgresql.replication.synchronousCommit }}
+    {{- if and .Values.postgresql.replication.enabled (gt (int .Values.postgresql.replicaCount) 1) }}
+    synchronous_standby_names = 'ANY 1 (*)'
+    {{- end }}
+
+    # Logging
+    log_destination = 'stderr'
+    logging_collector = off
+    log_min_messages = warning
+    log_connections = on
+    log_disconnections = on
+
+    # Checkpoints
+    checkpoint_completion_target = 0.9
+    wal_buffers = 16MB
+
+  # Replica server configuration
+  replica-postgresql.conf: |
+    # Connection settings
+    listen_addresses = '*'
+    port = 5432
+    max_connections = 200
+
+    # Memory settings
+    shared_buffers = 256MB
+    effective_cache_size = 768MB
+    work_mem = 4MB
+    maintenance_work_mem = 64MB
+
+    # Hot standby settings
+    hot_standby = on
+    hot_standby_feedback = on
+    max_standby_streaming_delay = 30s
+    wal_receiver_status_interval = 10s
+
+    # Logging
+    log_destination = 'stderr'
+    logging_collector = off
+    log_min_messages = warning
+
+  # pg_hba.conf - Host-based authentication
+  pg_hba.conf: |
+    # TYPE  DATABASE        USER            ADDRESS                 METHOD
+    local   all             all                                     trust
+    host    all             all             127.0.0.1/32            scram-sha-256
+    host    all             all             ::1/128                 scram-sha-256
+    host    all             all             0.0.0.0/0               scram-sha-256
+    host    replication     {{ .Values.postgresql.replication.user }}  0.0.0.0/0   scram-sha-256
+
+  # Initialization script for primary
+  init-primary.sh: |
+    #!/bin/bash
+    set -e
+
+    echo "Initializing PostgreSQL primary node..."
+
+    # Create replication user if it doesn't exist
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+      DO \$\$
+      BEGIN
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${REPLICATION_USER}') THEN
+          CREATE ROLE ${REPLICATION_USER} WITH REPLICATION LOGIN PASSWORD '${REPLICATION_PASSWORD}';
+        END IF;
+      END
+      \$\$;
+    EOSQL
+
+    # Create application user and database
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" <<-EOSQL
+      DO \$\$
+      BEGIN
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${APP_USER}') THEN
+          CREATE ROLE ${APP_USER} WITH LOGIN PASSWORD '${APP_PASSWORD}';
+        END IF;
+      END
+      \$\$;
+
+      GRANT ALL PRIVILEGES ON DATABASE ${POSTGRES_DB} TO ${APP_USER};
+    EOSQL
+
+    echo "Primary initialization complete."
+
+  # Script to setup replica
+  setup-replica.sh: |
+    #!/bin/bash
+    set -e
+
+    echo "Setting up PostgreSQL replica..."
+
+    PGDATA=${PGDATA:-/var/lib/postgresql/data}
+
+    # Wait for primary to be ready
+    until pg_isready -h ${PRIMARY_HOST} -p 5432 -U ${REPLICATION_USER}; do
+      echo "Waiting for primary to be ready..."
+      sleep 2
+    done
+
+    # If data directory is empty or doesn't have valid data, do base backup
+    if [ ! -s "$PGDATA/PG_VERSION" ]; then
+      echo "Performing base backup from primary..."
+      rm -rf ${PGDATA}/*
+
+      PGPASSWORD=${REPLICATION_PASSWORD} pg_basebackup \
+        -h ${PRIMARY_HOST} \
+        -p 5432 \
+        -U ${REPLICATION_USER} \
+        -D ${PGDATA} \
+        -Fp \
+        -Xs \
+        -P \
+        -R
+
+      echo "Base backup complete."
+    fi
+
+    # Create standby.signal file
+    touch ${PGDATA}/standby.signal
+
+    # Configure recovery settings
+    cat > ${PGDATA}/postgresql.auto.conf <<EOF
+    primary_conninfo = 'host=${PRIMARY_HOST} port=5432 user=${REPLICATION_USER} password=${REPLICATION_PASSWORD} application_name=${HOSTNAME}'
+    primary_slot_name = '${HOSTNAME//-/_}'
+    EOF
+
+    echo "Replica setup complete."
+
+  # Health check script
+  health-check.sh: |
+    #!/bin/bash
+    set -e
+
+    # Check if PostgreSQL is accepting connections
+    pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}
+
+    # For replicas, also check replication lag
+    if [ -f "${PGDATA}/standby.signal" ]; then
+      LAG=$(psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres} -t -c "SELECT CASE WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() THEN 0 ELSE EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp())::INTEGER END;")
+      if [ "$LAG" -gt 300 ]; then
+        echo "Replication lag is too high: ${LAG}s"
+        exit 1
+      fi
+    fi
+
+    exit 0

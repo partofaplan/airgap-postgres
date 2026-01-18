@@ -1,0 +1,79 @@
+{{- if .Values.haproxy.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "airgap-postgres.fullname" . }}-haproxy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "airgap-postgres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: haproxy
+data:
+  haproxy.cfg: |
+    global
+        maxconn 1000
+        log stdout format raw local0
+
+    resolvers k8s
+        nameserver dns1 kube-dns.kube-system.svc.cluster.local:53
+        resolve_retries 3
+        timeout resolve 1s
+        timeout retry   1s
+        hold other      10s
+        hold refused    10s
+        hold nx         10s
+        hold timeout    10s
+        hold valid      10s
+        hold obsolete   10s
+
+    defaults
+        log global
+        mode tcp
+        retries 3
+        timeout client 30m
+        timeout connect 10s
+        timeout server 30m
+        timeout check 5s
+
+    # Stats endpoint for monitoring
+    listen stats
+        mode http
+        bind *:8404
+        stats enable
+        stats uri /stats
+        stats refresh 10s
+        stats admin if LOCALHOST
+
+    # Primary (read-write) frontend
+    frontend postgresql_primary
+        bind *:5432
+        default_backend postgresql_primary_backend
+
+    # Read-only frontend (load balances across all nodes)
+    frontend postgresql_readonly
+        bind *:5433
+        default_backend postgresql_readonly_backend
+
+    # Backend for primary (read-write) - only routes to primary node
+    backend postgresql_primary_backend
+        option httpchk GET /primary
+        http-check expect status 200
+        default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions resolvers k8s init-addr none
+
+        {{- $fullname := include "airgap-postgres.fullname" . }}
+        {{- $headlessSvc := include "airgap-postgres.headless.serviceName" . }}
+        {{- $namespace := .Release.Namespace }}
+        {{- range $i := until (int .Values.postgresql.replicaCount) }}
+        server pg{{ $i }} {{ $fullname }}-{{ $i }}.{{ $headlessSvc }}.{{ $namespace }}.svc.cluster.local:5432 check port 8008
+        {{- end }}
+
+    # Backend for read-only connections - load balances across all healthy nodes
+    backend postgresql_readonly_backend
+        balance roundrobin
+        option httpchk GET /replica
+        http-check expect status 200
+        default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions resolvers k8s init-addr none
+
+        {{- range $i := until (int .Values.postgresql.replicaCount) }}
+        server pg{{ $i }} {{ $fullname }}-{{ $i }}.{{ $headlessSvc }}.{{ $namespace }}.svc.cluster.local:5432 check port 8008
+        {{- end }}
+{{- end }}

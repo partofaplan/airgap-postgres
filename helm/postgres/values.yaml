@@ -1,0 +1,144 @@
+# Air-gapped PostgreSQL Helm Chart Configuration
+# All images must be pulled from a single internal registry
+
+# Global settings
+global:
+  # Air-gapped registry - all images pulled from DockerHub partofaplan
+  imageRegistry: "docker.io/partofaplan"
+  imagePullSecrets: []
+  # Uncomment below if your registry requires authentication
+  # imagePullSecrets:
+  #   - name: registry-credentials
+
+# PostgreSQL configuration
+postgresql:
+  image:
+    repository: postgres
+    tag: "18"
+    pullPolicy: IfNotPresent
+
+  # Number of replicas (1 primary + N-1 replicas)
+  replicaCount: 3
+
+  # Database settings
+  database: appdb
+  username: appuser
+  # Password should be set via --set or external secret
+  password: ""
+
+  # Superuser password for postgres user
+  postgresPassword: ""
+
+  # Replication settings
+  replication:
+    enabled: true
+    user: replicator
+    password: ""
+    # Synchronous replication mode: "on", "off", or "remote_apply"
+    synchronousCommit: "on"
+
+  # Resource limits
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+
+  # Persistence settings
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 10Gi
+    accessModes:
+      - ReadWriteOnce
+
+# HAProxy load balancer configuration
+haproxy:
+  enabled: true
+  image:
+    repository: haproxy
+    tag: "2.9"
+    pullPolicy: IfNotPresent
+
+  replicaCount: 2
+
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "100m"
+    limits:
+      memory: "256Mi"
+      cpu: "500m"
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 5432
+    readOnlyPort: 5433
+
+# Backup configuration
+backup:
+  enabled: true
+  image:
+    repository: postgres
+    tag: "18"
+    pullPolicy: IfNotPresent
+
+  # Schedule in cron format (every hour)
+  schedule: "0 * * * *"
+
+  # Retention settings
+  retentionDays: 7
+
+  # Storage for backups
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 20Gi
+    accessModes:
+      - ReadWriteOnce
+
+# Recovery configuration
+recovery:
+  image:
+    repository: postgres
+    tag: "18"
+    pullPolicy: IfNotPresent
+
+# Service account
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod security context
+# Note: runAsNonRoot is not set at pod level to allow init container to run as root
+podSecurityContext:
+  fsGroup: 999
+
+# Container security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Affinity rules
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: airgap-postgres
+          topologyKey: kubernetes.io/hostname

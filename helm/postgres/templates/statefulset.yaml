@@ -1,0 +1,252 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "airgap-postgres.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "airgap-postgres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  serviceName: {{ include "airgap-postgres.headless.serviceName" . }}
+  replicas: {{ .Values.postgresql.replicaCount }}
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "airgap-postgres.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgresql
+  template:
+    metadata:
+      labels:
+        {{- include "airgap-postgres.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: postgresql
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "airgap-postgres.serviceAccountName" . }}
+      securityContext:
+        fsGroup: 999
+      initContainers:
+        - name: init-chmod-data
+          image: {{ include "airgap-postgres.postgresql.image" . }}
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+          command:
+            - /bin/bash
+            - -c
+            - |
+              mkdir -p /var/lib/postgresql/data
+              chmod 700 /var/lib/postgresql/data
+              chown -R 999:999 /var/lib/postgresql/data
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgresql
+          image: {{ include "airgap-postgres.postgresql.image" . }}
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          # Note: PostgreSQL official image requires running as root initially
+          # then drops privileges to postgres user via gosu
+          ports:
+            - name: postgresql
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_DB
+              value: {{ .Values.postgresql.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "airgap-postgres.secretName" . }}
+                  key: postgresql-postgres-password
+            - name: APP_USER
+              value: {{ .Values.postgresql.username | quote }}
+            - name: APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "airgap-postgres.secretName" . }}
+                  key: postgresql-password
+            - name: REPLICATION_USER
+              value: {{ .Values.postgresql.replication.user | quote }}
+            - name: REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "airgap-postgres.secretName" . }}
+                  key: postgresql-replication-password
+            - name: PRIMARY_HOST
+              value: "{{ include "airgap-postgres.fullname" . }}-0.{{ include "airgap-postgres.headless.serviceName" . }}.{{ .Release.Namespace }}.svc.cluster.local"
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          {{- if .Values.postgresql.replication.enabled }}
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    # Determine if this is primary (ordinal 0) or replica
+                    ORDINAL=${POD_NAME##*-}
+                    if [ "$ORDINAL" -eq 0 ]; then
+                      # This is the primary - add role label
+                      echo "Primary node - initialization handled by postgres"
+                    fi
+          {{- end }}
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - pg_isready -U postgres -d {{ .Values.postgresql.database }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  pg_isready -U postgres -d {{ .Values.postgresql.database }}
+                  if [ -f "${PGDATA}/standby.signal" ]; then
+                    # For replicas, check if replication is working
+                    psql -U postgres -d {{ .Values.postgresql.database }} -c "SELECT 1" > /dev/null 2>&1
+                  fi
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: config
+              mountPath: /docker-entrypoint-initdb.d/init-primary.sh
+              subPath: init-primary.sh
+            - name: config
+              mountPath: /etc/postgresql/pg_hba.conf
+              subPath: pg_hba.conf
+            - name: scripts
+              mountPath: /scripts
+        # Health check sidecar for HAProxy
+        - name: health-check
+          image: {{ include "airgap-postgres.postgresql.image" . }}
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # HTTP health check server for HAProxy using FIFO
+              FIFO=/tmp/healthcheck_fifo
+              rm -f $FIFO
+              mkfifo $FIFO
+
+              while true; do
+                # Read request and generate response
+                cat $FIFO | (
+                  read -r request
+
+                  # Check PostgreSQL status
+                  is_ready=$(pg_isready -h localhost -U postgres -d {{ .Values.postgresql.database }} > /dev/null 2>&1 && echo "true" || echo "false")
+                  is_primary=$(psql -h localhost -U postgres -d {{ .Values.postgresql.database }} -t -c "SELECT NOT pg_is_in_recovery();" 2>/dev/null | tr -d ' \n')
+
+                  if [[ "$request" == *"/primary"* ]]; then
+                    if [[ "$is_primary" == "t" && "$is_ready" == "true" ]]; then
+                      printf "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nprimary"
+                    else
+                      printf "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 11\r\nConnection: close\r\n\r\nnot primary"
+                    fi
+                  elif [[ "$request" == *"/replica"* ]]; then
+                    if [[ "$is_ready" == "true" ]]; then
+                      printf "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready"
+                    else
+                      printf "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot ready"
+                    fi
+                  else
+                    if [[ "$is_ready" == "true" ]]; then
+                      printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    else
+                      printf "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\nConnection: close\r\n\r\nerror"
+                    fi
+                  fi
+                ) | nc -l -p 8008 > $FIFO
+              done
+          ports:
+            - name: health
+              containerPort: 8008
+              protocol: TCP
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "airgap-postgres.secretName" . }}
+                  key: postgresql-postgres-password
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "50m"
+            limits:
+              memory: "64Mi"
+              cpu: "100m"
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "airgap-postgres.fullname" . }}-config
+            defaultMode: 0755
+        - name: scripts
+          configMap:
+            name: {{ include "airgap-postgres.fullname" . }}-config
+            defaultMode: 0755
+            items:
+              - key: setup-replica.sh
+                path: setup-replica.sh
+              - key: health-check.sh
+                path: health-check.sh
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.postgresql.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "airgap-postgres.labels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.postgresql.persistence.accessModes | nindent 10 }}
+        {{- if .Values.postgresql.persistence.storageClass }}
+        storageClassName: {{ .Values.postgresql.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.persistence.size | quote }}
+  {{- end }}

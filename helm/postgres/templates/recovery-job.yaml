@@ -1,0 +1,180 @@
+{{/*
+Recovery Job Template
+This is a Job template that can be instantiated to recover the database from a backup.
+To use: kubectl create job --from=cronjob/{{ include "airgap-postgres.fullname" . }}-recovery-template <job-name>
+Or apply this manifest directly after setting the backup file name.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "airgap-postgres.fullname" . }}-recovery
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "airgap-postgres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: recovery
+  annotations:
+    # This job should be manually triggered, not auto-deployed
+    helm.sh/hook: ""
+    # Annotation to indicate this is a template - delete after using
+    argocd.argoproj.io/hook: Skip
+spec:
+  # Set to 0 so the job must be manually triggered
+  suspend: true
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        {{- include "airgap-postgres.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: recovery
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "airgap-postgres.serviceAccountName" . }}
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: recovery
+          image: {{ include "airgap-postgres.recovery.image" . }}
+          imagePullPolicy: {{ .Values.recovery.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              echo "=============================================="
+              echo "PostgreSQL Database Recovery"
+              echo "Started at: $(date)"
+              echo "=============================================="
+
+              # Configuration
+              BACKUP_DIR="/backups"
+              BACKUP_FILE="${BACKUP_FILE:-latest.sql.gz}"
+
+              # Database connection - connect to primary
+              DB_HOST="{{ include "airgap-postgres.primary.serviceName" . }}"
+              DB_PORT="5432"
+              DB_NAME="{{ .Values.postgresql.database }}"
+              DB_USER="postgres"
+
+              # Determine the backup file to restore
+              if [ "${BACKUP_FILE}" = "latest.sql.gz" ]; then
+                RESTORE_FILE="${BACKUP_DIR}/latest.sql.gz"
+                if [ -L "${RESTORE_FILE}" ]; then
+                  ACTUAL_FILE=$(readlink -f ${RESTORE_FILE})
+                  echo "Using latest backup: ${ACTUAL_FILE}"
+                else
+                  echo "ERROR: latest.sql.gz symlink not found"
+                  echo "Available backups:"
+                  ls -la ${BACKUP_DIR}/*.sql.gz 2>/dev/null || echo "No backups found!"
+                  exit 1
+                fi
+              else
+                RESTORE_FILE="${BACKUP_DIR}/${BACKUP_FILE}"
+              fi
+
+              # Verify backup file exists
+              if [ ! -f "${RESTORE_FILE}" ]; then
+                echo "ERROR: Backup file not found: ${RESTORE_FILE}"
+                echo "Available backups:"
+                ls -la ${BACKUP_DIR}/*.sql.gz 2>/dev/null || echo "No backups found!"
+                exit 1
+              fi
+
+              BACKUP_SIZE=$(du -h ${RESTORE_FILE} | cut -f1)
+              echo "Backup file: ${RESTORE_FILE} (${BACKUP_SIZE})"
+
+              # Wait for database to be ready
+              echo "Waiting for database to be ready..."
+              until pg_isready -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER}; do
+                echo "Database not ready, waiting..."
+                sleep 5
+              done
+              echo "Database is ready"
+
+              # Confirmation prompt (will be skipped in automated runs)
+              echo ""
+              echo "WARNING: This will restore the database from backup."
+              echo "All current data will be OVERWRITTEN."
+              echo ""
+
+              # Perform the recovery
+              echo "Starting database recovery..."
+
+              # Decompress and restore
+              gunzip -c ${RESTORE_FILE} | psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d postgres \
+                --set ON_ERROR_STOP=off \
+                2>&1 | tee /tmp/recovery.log
+
+              RESTORE_STATUS=${PIPESTATUS[1]}
+
+              if [ ${RESTORE_STATUS} -eq 0 ]; then
+                echo ""
+                echo "=============================================="
+                echo "Recovery completed successfully!"
+                echo "Finished at: $(date)"
+                echo "=============================================="
+              else
+                echo ""
+                echo "=============================================="
+                echo "Recovery completed with warnings/errors"
+                echo "Check /tmp/recovery.log for details"
+                echo "Finished at: $(date)"
+                echo "=============================================="
+              fi
+
+              # Verify the recovery
+              echo ""
+              echo "Verifying recovery..."
+              psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${DB_NAME} -c "\dt" || true
+
+              echo ""
+              echo "Recovery job finished"
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "airgap-postgres.secretName" . }}
+                  key: postgresql-postgres-password
+            # Set this to specify a specific backup file (default: latest.sql.gz)
+            - name: BACKUP_FILE
+              value: "latest.sql.gz"
+          volumeMounts:
+            - name: backup-storage
+              mountPath: /backups
+              readOnly: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        - name: backup-storage
+          {{- if .Values.backup.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "airgap-postgres.fullname" . }}-backup
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

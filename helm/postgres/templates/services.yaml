@@ -1,0 +1,57 @@
+# Headless service for StatefulSet DNS resolution
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "airgap-postgres.headless.serviceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "airgap-postgres.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: postgresql
+  selector:
+    {{- include "airgap-postgres.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+---
+# Primary service - points to pod-0 (designated primary in StatefulSet)
+# Note: In a true HA setup with Patroni, this would use role labels
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "airgap-postgres.primary.serviceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "airgap-postgres.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: postgresql
+  selector:
+    {{- include "airgap-postgres.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+    statefulset.kubernetes.io/pod-name: {{ include "airgap-postgres.fullname" . }}-0
+---
+# Read-only service - load balances across all replicas (for read-heavy workloads)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "airgap-postgres.fullname" . }}-read
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "airgap-postgres.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: postgresql
+  selector:
+    {{- include "airgap-postgres.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
